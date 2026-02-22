@@ -77,8 +77,11 @@ export interface IngestFromUrlResult {
 /**
  * Clones/pulls a GitHub repo, scans it, and upserts the result into SQLite.
  * Shared by `seedOnStartup()` (env-var driven) and the POST /api/ingest/github route.
+ *
+ * @param repoUrl   - Full GitHub HTTPS URL to clone/scan
+ * @param teamName  - Optional team name to tag all ingested services with
  */
-export async function ingestFromUrl(repoUrl: string): Promise<IngestFromUrlResult> {
+export async function ingestFromUrl(repoUrl: string, teamName?: string): Promise<IngestFromUrlResult> {
     console.log(`\n[Seed] 🌱 Ingesting from ${repoUrl}`);
 
     const cloneDir = cloneOrPull(repoUrl);   // throws on git error
@@ -207,6 +210,13 @@ export async function ingestFromUrl(repoUrl: string): Promise<IngestFromUrlResul
         result.services[0]?.id ?? null,
         `${result.services.length} services · ${result.dependencies.length} deps · ${result.issues.length} issues (source: ${repoUrl})`,
     );
+
+    // If a teamName was supplied, stamp every ingested service with it so the
+    // graph can be filtered per-team in the Manager Dashboard.
+    if (teamName) {
+        db.prepare(`UPDATE services SET team = ? WHERE repo_url = ?`).run(teamName, repoUrl);
+        console.log(`[Seed] 🏷  Tagged all services from ${repoUrl} with team "${teamName}"`);
+    }
 
     try { saveSnapshot('latest'); } catch { /* non-fatal */ }
 

@@ -166,15 +166,27 @@ function parseEndpoints(raw: string | null): string[] {
 
 /**
  * Returns all service nodes with computed layout coordinates and connection counts.
+ * When teamName is supplied only that team's services + their external references are returned.
  * Used by GET /api/graph/nodes.
  *
+ * @param teamName - Optional team name to filter services by
  * @returns Array of GraphNode objects sorted by health score descending
  */
-export function getNodes(): GraphNode[] {
+export function getNodes(teamName?: string): GraphNode[] {
     const db = getDb();
 
-    // Internal services
-    const rows = db.prepare<[], ServiceRow>(`
+    const nodeQuery = db.prepare<unknown[], ServiceRow>(`
+    SELECT
+      s.id, s.name, s.team, s.language, s.health_score, s.health_tier,
+      s.repo_url, s.doc_coverage, s.test_coverage, s.last_ingested,
+      (SELECT COUNT(*) FROM dependencies WHERE source_id = s.id) +
+      (SELECT COUNT(*) FROM dependencies WHERE target_id = s.id) AS connection_count
+    FROM services s
+    WHERE s.is_external = 0 AND s.team = ?
+    ORDER BY s.health_score DESC
+  `);
+
+    const allNodesQuery = db.prepare<[], ServiceRow>(`
     SELECT
       s.id, s.name, s.team, s.language, s.health_score, s.health_tier,
       s.repo_url, s.doc_coverage, s.test_coverage, s.last_ingested,
@@ -183,10 +195,22 @@ export function getNodes(): GraphNode[] {
     FROM services s
     WHERE s.is_external = 0
     ORDER BY s.health_score DESC
-  `).all();
+  `);
 
-    // External nodes that are referenced by edges (databases, infra, storage, etc.)
-    const externalRows = db.prepare<[], ServiceRow>(`
+    // Internal services — fall back to all if no nodes match the requested team
+    let rows: ServiceRow[];
+    if (teamName) {
+        rows = nodeQuery.all(teamName);
+        if (rows.length === 0) rows = allNodesQuery.all();
+    } else {
+        rows = allNodesQuery.all();
+    }
+
+    const internalIds = rows.map(r => r.id);
+    const idPlaceholders = internalIds.length ? internalIds.map(() => '?').join(',') : "''";
+
+    // External nodes that are referenced by the (filtered) internal services
+    const externalRows = db.prepare<unknown[], ServiceRow>(`
     SELECT
       s.id, s.name, s.team, s.language, s.health_score, s.health_tier,
       s.repo_url, s.doc_coverage, s.test_coverage, s.last_ingested,
@@ -194,10 +218,12 @@ export function getNodes(): GraphNode[] {
       (SELECT COUNT(*) FROM dependencies WHERE target_id = s.id) AS connection_count
     FROM services s
     WHERE s.is_external = 1
-      AND (EXISTS (SELECT 1 FROM dependencies WHERE target_id = s.id)
-        OR EXISTS (SELECT 1 FROM dependencies WHERE source_id = s.id))
+      AND (
+        EXISTS (SELECT 1 FROM dependencies WHERE target_id = s.id AND source_id IN (${idPlaceholders}))
+        OR EXISTS (SELECT 1 FROM dependencies WHERE source_id = s.id AND target_id IN (${idPlaceholders}))
+      )
     ORDER BY s.name
-  `).all();
+  `).all(...internalIds, ...internalIds);
 
     const edgeRows = db.prepare<[], { source_id: string; target_id: string }>(
         'SELECT source_id, target_id FROM dependencies',
@@ -241,16 +267,35 @@ export function getNodes(): GraphNode[] {
 
 /**
  * Returns all dependency edges in the graph.
+ * When teamName is supplied only edges where at least one endpoint belongs to
+ * that team are returned.
  * Used by GET /api/graph/edges.
  *
+ * @param teamName - Optional team name to filter edges by
  * @returns Array of GraphEdge objects
  */
-export function getEdges(): GraphEdge[] {
+export function getEdges(teamName?: string): GraphEdge[] {
     const db = getDb();
 
-    const rows = db.prepare<[], DepRow>(
-        'SELECT id, source_id, target_id, type, endpoints, strength FROM dependencies',
-    ).all();
+    let rows: DepRow[];
+    if (teamName) {
+        rows = db.prepare<unknown[], DepRow>(`
+            SELECT d.id, d.source_id, d.target_id, d.type, d.endpoints, d.strength
+            FROM dependencies d
+            WHERE d.source_id IN (SELECT id FROM services WHERE team = ?)
+               OR d.target_id IN (SELECT id FROM services WHERE team = ?)
+        `).all(teamName, teamName);
+        // Fall back to all edges if the team has no matching services
+        if (rows.length === 0) {
+            rows = db.prepare<[], DepRow>(
+                'SELECT id, source_id, target_id, type, endpoints, strength FROM dependencies',
+            ).all();
+        }
+    } else {
+        rows = db.prepare<[], DepRow>(
+            'SELECT id, source_id, target_id, type, endpoints, strength FROM dependencies',
+        ).all();
+    }
 
     return rows.map((r): GraphEdge => ({
         id: r.id,

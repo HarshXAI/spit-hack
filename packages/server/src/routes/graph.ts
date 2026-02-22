@@ -21,9 +21,10 @@ import {
 export const graphRouter: ExpressRouter = Router();
 
 // ── GET /nodes ────────────────────────────────────────────────────────────────
-graphRouter.get('/nodes', (_req: Request, res: Response) => {
+graphRouter.get('/nodes', (req: Request, res: Response) => {
     try {
-        const nodes = getNodes();
+        const team = typeof req.query.team === 'string' && req.query.team ? req.query.team : undefined;
+        const nodes = getNodes(team);
         res.json({ success: true, data: nodes, meta: { count: nodes.length } });
     } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error';
@@ -32,9 +33,10 @@ graphRouter.get('/nodes', (_req: Request, res: Response) => {
 });
 
 // ── GET /edges ────────────────────────────────────────────────────────────────
-graphRouter.get('/edges', (_req: Request, res: Response) => {
+graphRouter.get('/edges', (req: Request, res: Response) => {
     try {
-        const edges = getEdges();
+        const team = typeof req.query.team === 'string' && req.query.team ? req.query.team : undefined;
+        const edges = getEdges(team);
         res.json({ success: true, data: edges, meta: { count: edges.length } });
     } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error';

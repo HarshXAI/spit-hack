@@ -125,6 +125,8 @@ router.post('/github', async (req: Request, res: Response): Promise<void> => {
     res.status(400).json(err('repoUrl must point to a GitHub repository (github.com/...)'));
     return;
   }
+  const teamName = (req.body as { teamName?: string }).teamName?.trim() || undefined;
+
   try {
     // Wipe all stale graph data so the KG reflects only this repo
     const db = getDb();
@@ -139,7 +141,7 @@ router.post('/github', async (req: Request, res: Response): Promise<void> => {
       DELETE FROM snapshots;
     `);
 
-    const result = await ingestFromUrl(repoUrl);
+    const result = await ingestFromUrl(repoUrl, teamName);
     res.status(200).json(ok(result));
   } catch (e) {
     const message = e instanceof Error ? e.message : 'Ingestion failed';
