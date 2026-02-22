@@ -4,7 +4,7 @@
   "private": true,
   "description": "KA-CHOW React frontend (built in Lovable — lives in precision-canvas workspace)",
   "scripts": {
-    "dev": "echo 'Frontend lives at /Users/harshkanani/Desktop/precision-canvas — run: cd ../../precision-canvas && bun dev'",
-    "build": "echo 'Run: cd ../../precision-canvas && bun run build'"
+    "dev": "echo Frontend lives in the precision-canvas workspace. Run: cd ../precision-canvas and then: bun dev",
+    "build": "echo Frontend lives in the precision-canvas workspace. Run: cd ../precision-canvas and then: bun run build"
   }
 }

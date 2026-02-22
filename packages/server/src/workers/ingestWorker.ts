@@ -12,7 +12,7 @@
 import { Worker, Job } from 'bullmq';
 import { randomUUID } from 'crypto';
 import { saveSnapshot } from '../services/graphService.js';
-import { getRedis } from '../queues/redis.js';
+import { getRedis, isRedisDisabled } from '../queues/redis.js';
 import { getDb } from '../db/index.js';
 import { scanRepo, serviceIdFromName } from '../services/scannerService.js';
 import { emit, closeJob } from '../sse/sseManager.js';
@@ -262,13 +262,38 @@ async function processCommitJob(job: Job<CommitJobData>): Promise<void> {
 let _worker: Worker<AnyIngestJobData> | null = null;
 
 /**
- * Creates and registers the BullMQ ingest worker.
- * The worker processes one job at a time (concurrency: 1) to avoid
- * overwhelming the SQLite write lock.
- *
- * @returns The registered Worker instance
+ * Run a full-repo ingest job directly in-process (no Redis/BullMQ needed).
+ * Used when DISABLE_REDIS=true.
  */
-export function startIngestWorker(): Worker<AnyIngestJobData> {
+export async function runIngestDirect(data: IngestJobData): Promise<void> {
+    // Wrap in a minimal Job-like object so processIngestJob stays unchanged
+    await processIngestJob({ data } as Job<IngestJobData>);
+}
+
+/**
+ * Run a commit re-scan job directly in-process (no Redis/BullMQ needed).
+ * Used when DISABLE_REDIS=true.
+ */
+export async function runCommitDirect(data: CommitJobData): Promise<void> {
+    await processCommitJob({ data } as Job<CommitJobData>);
+}
+
+/**
+ * Creates and registers the BullMQ ingest worker.
+ * No-ops when Redis is disabled — jobs run via runIngestDirect() instead.
+ *
+ * @returns The registered Worker instance, or null if Redis is disabled
+ */
+export function startIngestWorker(): Worker<AnyIngestJobData> | null {
+    if (isRedisDisabled()) {
+        console.log('[IngestWorker] Redis disabled — jobs will run in-process.');
+        return null;
+    }
+    const redis = getRedis();
+    if (!redis) {
+        console.log('[IngestWorker] Redis unavailable — jobs will run in-process.');
+        return null;
+    }
     if (_worker) return _worker;
 
     _worker = new Worker<AnyIngestJobData>(
@@ -281,7 +306,7 @@ export function startIngestWorker(): Worker<AnyIngestJobData> {
             }
         },
         {
-            connection: getRedis(),
+            connection: redis,
             concurrency: 1,
         },
     );
