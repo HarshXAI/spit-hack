@@ -1,0 +1,11 @@
+# KA-CHOW Python Agents — requirements
+# ALWAYS activate venv before installing:
+#   cd packages/python-agents
+#   python3 -m venv venv
+#   source venv/bin/activate   # Windows: venv\Scripts\activate
+#   pip install -r requirements.txt
+#
+# NEVER install these globally.
+
+networkx>=3.2
+astunparse>=1.6.3

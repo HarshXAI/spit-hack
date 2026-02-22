@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# Environment variables — NEVER commit secrets
+# .env
+# .env.local
+# .env.*.local
+
+# Python virtual environment
+packages/python-agents/venv/
+packages/python-agents/__pycache__/
+packages/python-agents/src/__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+pnpm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/settings.json
+.idea/
+
+# Coverage
+coverage/
+.nyc_output/
+
+# turbo
+.turbo/

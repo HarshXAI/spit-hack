@@ -1,0 +1,58 @@
+# kachow.config.yaml — example configuration
+# Copy and edit this file in any repository you want KA-CHOW to monitor.
+
+version: 1
+
+project:
+  name: "My Platform"
+  description: "Microservices platform"
+
+repos:
+  - name: auth-service
+    path: ./services/auth-service
+    team: platform
+    language: typescript
+
+  - name: payments-api
+    path: ./services/payments-api
+    team: payments
+    language: python
+
+standards:
+  require_openapi_spec: true
+  require_readme: true
+  require_error_handling: true
+  min_test_coverage: 70
+  require_retry_on_external_calls: true
+
+integrations:
+  github:
+    token: ${GITHUB_TOKEN}
+    webhook_secret: ${GITHUB_WEBHOOK_SECRET}
+    block_high_risk_prs: true
+    risk_score_threshold: 7
+
+  slack:
+    bot_token: ${SLACK_BOT_TOKEN}
+    channels:
+      alerts: "#engineering-alerts"
+      incidents: "#incidents"
+      team_platform: "#platform-team"
+      team_payments: "#payments-team"
+
+  jira:
+    base_url: https://yourcompany.atlassian.net
+    email: ${JIRA_EMAIL}
+    token: ${JIRA_API_TOKEN}
+    project_key: ENG
+
+  confluence:
+    base_url: https://yourcompany.atlassian.net/wiki
+    token: ${CONFLUENCE_TOKEN}
+    adr_space: ADRS
+
+llm:
+  anthropic_key: ${ANTHROPIC_API_KEY}
+  openai_key: ${OPENAI_API_KEY}
+  qa_model: claude-sonnet-4-6
+  healing_model: gpt-4o

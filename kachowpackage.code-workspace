@@ -1,0 +1,13 @@
+{
+  "folders": [
+    {
+      "name": "kachowpackage",
+      "path": ".",
+    },
+    {
+      "name": "precision-canvas",
+      "path": "../precision-canvas",
+    },
+  ],
+  "settings": {},
+}

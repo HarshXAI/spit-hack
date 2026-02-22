@@ -1,0 +1,10 @@
+{
+  "name": "@kachow/frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "KA-CHOW React frontend (built in Lovable — lives in precision-canvas workspace)",
+  "scripts": {
+    "dev": "echo 'Frontend lives at /Users/harshkanani/Desktop/precision-canvas — run: cd ../../precision-canvas && bun dev'",
+    "build": "echo 'Run: cd ../../precision-canvas && bun run build'"
+  }
+}

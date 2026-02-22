@@ -1,0 +1,633 @@
+/**
+ * Repository scanner service.
+ * Walks a local repo directory, detects services (package.json / setup.py),
+ * extracts HTTP dependency calls from source files, and calculates health scores.
+ * Called from the BullMQ ingest worker — NOT directly from routes.
+ */
+
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { execSync } from 'child_process';
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+export interface ScannedService {
+    id: string;
+    name: string;
+    repoPath: string;
+    repoUrl: string | null;
+    repoSubpath: string | null;
+    team: string | null;
+    language: 'typescript' | 'javascript' | 'python' | 'unknown';
+    healthScore: number;
+    docCoverage: number;
+    testCoverage: number;
+    lastCommit: string | null;
+    endpoints: ScannedEndpoint[];
+    rawIssues: string[];
+}
+
+export interface ScannedEndpoint {
+    path: string;
+    method: string;
+    deprecated: boolean;
+    hasOpenApiSpec: boolean;
+}
+
+export interface ScannedDependency {
+    sourceId: string;
+    targetName: string;  // resolved to service ID later
+    targetUrl: string;
+    type: 'REST' | 'Event' | 'gRPC' | 'DB';
+    endpoints: string[];
+}
+
+export interface ScanResult {
+    services: ScannedService[];
+    dependencies: ScannedDependency[];
+    issues: string[];
+}
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/** Directories to always skip during directory walks. */
+const SKIP_DIRS = new Set([
+    'node_modules', '.git', 'dist', 'build', '.next', '__pycache__',
+    'venv', '.venv', 'coverage', '.nyc_output', 'vendor',
+]);
+
+/** Source file extensions to scan for dependency patterns. */
+const SOURCE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py']);
+
+// ── Regex patterns for dependency detection ───────────────────────────────────
+
+/** HTTP call patterns: axios, fetch, got, request */
+const HTTP_CALL_RE =
+    /(?:axios|got|request)\s*\.\s*(?:get|post|put|patch|delete)\s*\(\s*[`'"]([^`'"]+)[`'"]/g;
+const FETCH_RE =
+    /fetch\s*\(\s*[`'"]([^`'"\s]+)[`'"]/g;
+
+/** Kafka producer/consumer patterns */
+const KAFKA_PRODUCER_RE = /producer\.send\s*\(\s*\{\s*topic:\s*[`'"]([^`'"]+)[`'"]/g;
+const KAFKA_CONSUMER_RE = /consumer\.subscribe\s*\(\s*\{\s*topics?:\s*[`'"\[]([^`'"\]]+)[`'"]/g;
+
+/**
+ * Env-var HTTP template literals: axios.get(`${process.env.USER_SERVICE}/path`)
+ * Captures the env var name and optional path prefix.
+ */
+const ENV_VAR_HTTP_RE =
+    /(?:axios|got|request|fetch)\s*(?:\.\s*(?:get|post|put|patch|delete)\s*)?\(\s*`\s*\$\{process\.env\.([A-Za-z_]+)\}([^`]*)`/g;
+
+/**
+ * RabbitMQ/amqplib: channel operations with an inline string literal.
+ * e.g. channel.sendToQueue("queue-name", ...) or channel.consume("queue-name", ...)
+ */
+const AMQP_LITERAL_RE =
+    /channel\s*\.\s*(?:sendToQueue|publish|assertQueue|consume|bindQueue)\s*\(\s*[`'"]([^`'"]+)[`'"]/g;
+
+/**
+ * RabbitMQ/amqplib: channel operations with a variable argument.
+ * e.g. channel.consume(queueName, ...) — requires variable → string resolution.
+ */
+const AMQP_VAR_RE =
+    /channel\s*\.\s*(?:sendToQueue|publish|assertQueue|consume|bindQueue)\s*\(\s*(\w+)/g;
+
+/**
+ * RabbitMQ wrapper functions like publishToQueue("queue-name", ...) —
+ * common pattern where users wrap amqplib behind a helper function.
+ */
+const AMQP_WRAPPER_FN_RE =
+    /(?:publish|send|enqueue)To(?:Queue|Topic|Exchange)\s*\(\s*[`'"]([^`'"]+)[`'"]/gi;
+
+/** gRPC: detect .proto file references */
+const GRPC_RE = /loadPackageDefinition|\.proto[`'"]/g;
+
+/** DB connection detection */
+const DB_URL_RE = /DATABASE_URL|Prisma|Sequelize|createConnection|mongoose\.connect/g;
+
+// ── Utility helpers ───────────────────────────────────────────────────────────
+
+/**
+ * Recursively collects all file paths under a directory, skipping SKIP_DIRS.
+ *
+ * @param dir - Root directory to walk
+ * @returns Flat array of absolute file paths
+ */
+function walkDir(dir: string): string[] {
+    const results: string[] = [];
+    let entries: fs.Dirent[];
+    try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+        return results;
+    }
+    for (const entry of entries) {
+        if (SKIP_DIRS.has(entry.name)) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+            results.push(...walkDir(full));
+        } else {
+            results.push(full);
+        }
+    }
+    return results;
+}
+
+/**
+ * Reads a file safely — returns empty string on any error.
+ *
+ * @param filePath - Absolute path to the file
+ * @returns File contents as string
+ */
+function readSafe(filePath: string): string {
+    try {
+        return fs.readFileSync(filePath, 'utf8');
+    } catch {
+        return '';
+    }
+}
+
+/**
+ * Generates a stable service ID from its name.
+ * Uses first 12 hex chars of SHA-256 for reproducibility across scans.
+ *
+ * @param name - Service name
+ * @returns 12-char hex string
+ */
+export function serviceIdFromName(name: string): string {
+    return crypto.createHash('sha256').update(name).digest('hex').slice(0, 12);
+}
+
+// ── Health score calculation ──────────────────────────────────────────────────
+
+/**
+ * Calculates a weighted health score (0–100) for a service directory.
+ * Per brief:
+ *   25% — OpenAPI/Swagger spec exists
+ *   15% — README.md exists and >200 chars
+ *   20% — test coverage >70% (parse coverage report if present)
+ *   20% — no deprecated endpoints still being called
+ *   10% — all external calls have try/catch (simplified: penalise if bare calls found)
+ *   10% — no P1 incidents in last 30 days (checked from DB at route level)
+ *
+ * @param serviceDir - Root directory of the service
+ * @param allFiles - Pre-walked file list for the service
+ * @returns Health score 0–100
+ * @throws Never — returns 0 on unexpected error
+ */
+export function calculateHealthScore(
+    serviceDir: string,
+    allFiles: string[],
+): { score: number; docCoverage: number; testCoverage: number; issues: string[] } {
+    const issues: string[] = [];
+    let score = 0;
+
+    // 25% — OpenAPI spec
+    const hasOpenApi = allFiles.some((f) => {
+        const base = path.basename(f).toLowerCase();
+        return base === 'openapi.yaml' || base === 'openapi.json' ||
+            base === 'swagger.yaml' || base === 'swagger.json';
+    });
+    if (hasOpenApi) {
+        score += 25;
+    } else {
+        issues.push('Missing OpenAPI/Swagger spec');
+    }
+
+    // 15% — README exists and >200 chars
+    const readmePath = path.join(serviceDir, 'README.md');
+    const readmeContent = readSafe(readmePath);
+    const hasReadme = readmeContent.length > 200;
+    if (hasReadme) {
+        score += 15;
+    } else {
+        issues.push(readmeContent.length === 0 ? 'Missing README.md' : 'README.md is too short (<200 chars)');
+    }
+    const docCoverage = hasOpenApi && hasReadme ? 100 : hasOpenApi || hasReadme ? 50 : 0;
+
+    // 20% — test coverage >70%
+    let testCoverage = 0;
+    const coveragePaths = [
+        path.join(serviceDir, 'coverage', 'coverage-summary.json'),
+        path.join(serviceDir, 'coverage', 'coverage-final.json'),
+    ];
+    let coverageFound = false;
+    for (const cp of coveragePaths) {
+        const raw = readSafe(cp);
+        if (!raw) continue;
+        try {
+            const parsed: Record<string, { lines?: { pct?: number } }> = JSON.parse(raw);
+            const totals = parsed['total'];
+            if (totals?.lines?.pct !== undefined) {
+                testCoverage = totals.lines.pct;
+                coverageFound = true;
+                break;
+            }
+        } catch {
+            // Malformed JSON — skip
+        }
+    }
+
+    // Also check for a test directory as proxy signal
+    const hasTestDir = allFiles.some((f) => {
+        const rel = path.relative(serviceDir, f);
+        return rel.startsWith('test') || rel.startsWith('__tests__') || rel.startsWith('spec');
+    });
+
+    if (coverageFound) {
+        if (testCoverage >= 70) {
+            score += 20;
+        } else {
+            issues.push(`Test coverage is ${testCoverage.toFixed(1)}% (need ≥70%)`);
+        }
+    } else if (hasTestDir) {
+        // Assume passing if we see tests but no coverage report
+        score += 10;
+        testCoverage = 50; // estimate
+    } else {
+        issues.push('No tests detected');
+    }
+
+    // 20% — no deprecated endpoints being called (will be cross-checked at route level)
+    // We grant this unless we detect @deprecated markers in source
+    const sourceFiles = allFiles.filter((f) => SOURCE_EXTS.has(path.extname(f)));
+    const hasDeprecatedCalls = sourceFiles.some((f) => {
+        const content = readSafe(f);
+        return /@deprecated/.test(content);
+    });
+    if (!hasDeprecatedCalls) {
+        score += 20;
+    } else {
+        issues.push('Deprecated endpoint references found in source');
+    }
+
+    // 10% — external calls have try/catch (simplified check)
+    const bareCallFiles = sourceFiles.filter((f) => {
+        const content = readSafe(f);
+        // Look for fetch/axios calls NOT inside a try block (heuristic)
+        const hasBareCall = /^\s*(?:await\s+)?(?:fetch|axios)\s*\(/m.test(content);
+        const hasTryCatch = /try\s*\{/.test(content);
+        return hasBareCall && !hasTryCatch;
+    });
+    if (bareCallFiles.length === 0) {
+        score += 10;
+    } else {
+        issues.push(`${bareCallFiles.length} file(s) with unprotected external calls`);
+    }
+
+    // 10% — no P1 incidents (checked from DB at service level, grant by default here)
+    score += 10;
+
+    return { score: Math.min(100, Math.max(0, score)), docCoverage, testCoverage, issues };
+}
+
+// ── Dependency detection ──────────────────────────────────────────────────────
+
+/**
+ * Scans all source files in a service for outbound HTTP calls, Kafka topics,
+ * gRPC uses, and DB connections.
+ *
+ * @param serviceDir - Root directory of the service
+ * @param serviceId - Stable service ID (used as sourceId on edges)
+ * @param allFiles - Pre-walked file list
+ * @returns Array of raw dependency records (targetName still unresolved to ID)
+ */
+export function detectDependencies(
+    _serviceDir: string,
+    serviceId: string,
+    allFiles: string[],
+): ScannedDependency[] {
+    const deps: ScannedDependency[] = [];
+    const sourceFiles = allFiles.filter((f) => SOURCE_EXTS.has(path.extname(f)));
+
+    for (const filePath of sourceFiles) {
+        const content = readSafe(filePath);
+        if (!content) continue;
+
+        // Declare shared match variable at the top of each file's loop
+        let m: RegExpExecArray | null;
+
+        // HTTP calls
+        for (const re of [HTTP_CALL_RE, FETCH_RE]) {
+            re.lastIndex = 0;
+            let m: RegExpExecArray | null;
+            while ((m = re.exec(content)) !== null) {
+                const rawUrl = m[1];
+                if (!rawUrl || rawUrl.startsWith('/')) continue; // skip relative paths
+                deps.push({
+                    sourceId: serviceId,
+                    targetName: extractHostname(rawUrl),
+                    targetUrl: rawUrl,
+                    type: 'REST',
+                    endpoints: [rawUrl],
+                });
+            }
+        }
+
+        // ── Env-var HTTP calls ─────────────────────────────────────────────
+        // Handles: axios.get(`${process.env.USER_SERVICE}/api/v1/user/${id}`)
+        ENV_VAR_HTTP_RE.lastIndex = 0;
+        while ((m = ENV_VAR_HTTP_RE.exec(content)) !== null) {
+            const envVarName = m[1];
+            // Trim dynamic path segments after the static prefix
+            const pathPart = (m[2] ?? '').split(/\$\{/)[0].split('?')[0];
+            deps.push({
+                sourceId: serviceId,
+                targetName: `env:${envVarName}`,
+                targetUrl: `env://${envVarName}${pathPart}`,
+                type: 'REST',
+                endpoints: [pathPart || '/'],
+            });
+        }
+
+        // ── RabbitMQ ──────────────────────────────────────────────────────────
+        // Two-pass: first collect all const/let/var = "string" assignments,
+        // then resolve variable-argument channel calls.
+        const varAssigns = new Map<string, string>();
+        const VAR_ASSIGN_RE = /(?:const|let|var)\s+(\w+)\s*=\s*["'`]([^"'`\n]{2,80})["'`]/g;
+        VAR_ASSIGN_RE.lastIndex = 0;
+        while ((m = VAR_ASSIGN_RE.exec(content)) !== null) {
+            varAssigns.set(m[1], m[2]);
+        }
+
+        // Inline string literal queue names
+        AMQP_LITERAL_RE.lastIndex = 0;
+        while ((m = AMQP_LITERAL_RE.exec(content)) !== null) {
+            const queueName = m[1];
+            if (queueName && queueName.length > 1) {
+                deps.push({
+                    sourceId: serviceId,
+                    targetName: `amqp:${queueName}`,
+                    targetUrl: `amqp://${queueName}`,
+                    type: 'Event',
+                    endpoints: [queueName],
+                });
+            }
+        }
+
+        // Variable-based queue names — resolve through assignment map
+        AMQP_VAR_RE.lastIndex = 0;
+        while ((m = AMQP_VAR_RE.exec(content)) !== null) {
+            const varName = m[1];
+            const queueName = varAssigns.get(varName);
+            if (queueName && queueName.length > 1 && !queueName.startsWith('$')) {
+                deps.push({
+                    sourceId: serviceId,
+                    targetName: `amqp:${queueName}`,
+                    targetUrl: `amqp://${queueName}`,
+                    type: 'Event',
+                    endpoints: [queueName],
+                });
+            }
+        }
+
+        // Wrapper function calls: publishToQueue("queue-name", ...)
+        AMQP_WRAPPER_FN_RE.lastIndex = 0;
+        while ((m = AMQP_WRAPPER_FN_RE.exec(content)) !== null) {
+            const queueName = m[1];
+            if (queueName && queueName.length > 1) {
+                deps.push({
+                    sourceId: serviceId,
+                    targetName: `amqp:${queueName}`,
+                    targetUrl: `amqp://${queueName}`,
+                    type: 'Event',
+                    endpoints: [queueName],
+                });
+            }
+        }
+
+        // Kafka events
+        KAFKA_PRODUCER_RE.lastIndex = 0;
+        while ((m = KAFKA_PRODUCER_RE.exec(content)) !== null) {
+            deps.push({
+                sourceId: serviceId,
+                targetName: `kafka:${m[1]}`,
+                targetUrl: `kafka://${m[1]}`,
+                type: 'Event',
+                endpoints: [m[1]],
+            });
+        }
+        KAFKA_CONSUMER_RE.lastIndex = 0;
+        while ((m = KAFKA_CONSUMER_RE.exec(content)) !== null) {
+            deps.push({
+                sourceId: serviceId,
+                targetName: `kafka:${m[1]}`,
+                targetUrl: `kafka://${m[1]}`,
+                type: 'Event',
+                endpoints: [m[1]],
+            });
+        }
+
+        // gRPC
+        if (GRPC_RE.test(content)) {
+            deps.push({
+                sourceId: serviceId,
+                targetName: 'grpc-target',
+                targetUrl: 'grpc://unknown',
+                type: 'gRPC',
+                endpoints: [],
+            });
+        }
+
+        // DB
+        if (DB_URL_RE.test(content)) {
+            deps.push({
+                sourceId: serviceId,
+                targetName: 'database',
+                targetUrl: 'db://internal',
+                type: 'DB',
+                endpoints: [],
+            });
+        }
+    }
+
+    // Deduplicate by targetName + type
+    const seen = new Set<string>();
+    return deps.filter((d) => {
+        const key = `${d.targetName}:${d.type}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
+/**
+ * Detects endpoints exposed by a service by scanning Express/Fastify/Flask route definitions.
+ *
+ * @param allFiles - Pre-walked file list
+ * @returns Array of discovered endpoint definitions
+ */
+export function detectEndpoints(allFiles: string[]): ScannedEndpoint[] {
+    const endpoints: ScannedEndpoint[] = [];
+    const sourceFiles = allFiles.filter((f) => SOURCE_EXTS.has(path.extname(f)));
+
+    // Express: router.get('/path', ...) / app.post('/path', ...)
+    const EXPRESS_RE =
+        /(?:router|app)\s*\.\s*(get|post|put|patch|delete|all)\s*\(\s*[`'"]([^`'"]+)[`'"]/gi;
+    // Flask: @app.route('/path', methods=['GET'])
+    const FLASK_RE = /@(?:app|blueprint)\.route\s*\(\s*[`'"]([^`'"]+)[`'"]/gi;
+
+    for (const filePath of sourceFiles) {
+        const content = readSafe(filePath);
+        if (!content) continue;
+
+        EXPRESS_RE.lastIndex = 0;
+        let m: RegExpExecArray | null;
+        while ((m = EXPRESS_RE.exec(content)) !== null) {
+            endpoints.push({
+                method: m[1].toUpperCase(),
+                path: m[2],
+                deprecated: content.includes('@deprecated'),
+                hasOpenApiSpec: false,
+            });
+        }
+
+        FLASK_RE.lastIndex = 0;
+        while ((m = FLASK_RE.exec(content)) !== null) {
+            endpoints.push({
+                method: 'GET', // default for Flask routes without explicit method
+                path: m[1],
+                deprecated: false,
+                hasOpenApiSpec: false,
+            });
+        }
+    }
+
+    return endpoints;
+}
+
+// ── Service discovery ─────────────────────────────────────────────────────────
+
+/**
+ * Detects the primary programming language of a service directory.
+ *
+ * @param allFiles - Pre-walked file list
+ * @returns Language string
+ */
+function detectLanguage(
+    allFiles: string[],
+): 'typescript' | 'javascript' | 'python' | 'unknown' {
+    const hasPkgJson = allFiles.some((f) => path.basename(f) === 'package.json');
+    const hasTsConfig = allFiles.some((f) => path.basename(f) === 'tsconfig.json');
+    const hasPyFiles = allFiles.some((f) => path.extname(f) === '.py');
+    const hasTsFiles = allFiles.some((f) => path.extname(f) === '.ts' || path.extname(f) === '.tsx');
+
+    if (hasPkgJson && (hasTsConfig || hasTsFiles)) return 'typescript';
+    if (hasPkgJson) return 'javascript';
+    if (hasPyFiles) return 'python';
+    return 'unknown';
+}
+
+/**
+ * Scans a single repository root directory.
+ * Discovers services (one per detected package.json / setup.py root),
+ * calculates health scores, and detects dependencies.
+ *
+ * @param repoPath - Absolute path to the repository root
+ * @param repoUrl - Optional remote URL (stored for display)
+ * @param team - Optional team name override
+ * @returns Full scan result with services, dependencies, and issues
+ * @throws Error if repoPath does not exist or is not a directory
+ */
+export function scanRepo(repoPath: string, repoUrl?: string, team?: string): ScanResult {
+    if (!fs.existsSync(repoPath)) {
+        throw new Error(`Repository path does not exist: ${repoPath}`);
+    }
+
+    const stat = fs.statSync(repoPath);
+    if (!stat.isDirectory()) {
+        throw new Error(`Repository path is not a directory: ${repoPath}`);
+    }
+
+    const allFiles = walkDir(repoPath);
+    const services: ScannedService[] = [];
+    const allDeps: ScannedDependency[] = [];
+    const globalIssues: string[] = [];
+
+    // Determine service name from package.json or directory name
+    const pkgJsonPath = path.join(repoPath, 'package.json');
+    let serviceName: string;
+    if (fs.existsSync(pkgJsonPath)) {
+        try {
+            const pkg: { name?: string } = JSON.parse(readSafe(pkgJsonPath));
+            serviceName = pkg.name ?? path.basename(repoPath);
+        } catch {
+            serviceName = path.basename(repoPath);
+        }
+    } else {
+        serviceName = path.basename(repoPath);
+    }
+
+    // Auto-detect GitHub remote URL from git config when not explicitly provided
+    let resolvedRepoUrl = repoUrl ?? null;
+    let repoSubpath: string | null = null;
+    try {
+        const gitRoot = execSync('git rev-parse --show-toplevel', { cwd: repoPath, stdio: 'pipe' })
+            .toString().trim();
+        // Subpath = relative path from git root to the scanned directory
+        const rel = repoPath.startsWith(gitRoot)
+            ? repoPath.slice(gitRoot.length).replace(/^\//, '')
+            : null;
+        repoSubpath = rel || null;
+
+        if (!resolvedRepoUrl) {
+            const raw = execSync('git remote get-url origin', { cwd: repoPath, stdio: 'pipe' })
+                .toString().trim()
+                .replace(/\.git$/, '')
+                .replace(/^git@([^:]+):(.+)$/, 'https://$1/$2');
+            resolvedRepoUrl = raw;
+        }
+    } catch {
+        /* not a git repo or no remote — keep null */
+    }
+
+    const serviceId = serviceIdFromName(serviceName);
+    const language = detectLanguage(allFiles);
+    const { score, docCoverage, testCoverage, issues } = calculateHealthScore(repoPath, allFiles);
+    const endpoints = detectEndpoints(allFiles);
+    const deps = detectDependencies(repoPath, serviceId, allFiles);
+
+    services.push({
+        id: serviceId,
+        name: serviceName,
+        repoPath,
+        repoUrl: resolvedRepoUrl,
+        repoSubpath,
+        team: team ?? null,
+        language,
+        healthScore: score,
+        docCoverage,
+        testCoverage,
+        lastCommit: null,
+        endpoints,
+        rawIssues: issues,
+    });
+
+    allDeps.push(...deps);
+
+    return {
+        services,
+        dependencies: allDeps,
+        issues: [...issues, ...globalIssues],
+    };
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Extracts hostname from a URL string for dependency target naming.
+ * Returns the raw URL string if parsing fails.
+ *
+ * @param rawUrl - Raw URL string potentially with template variables
+ * @returns Hostname or original string
+ */
+function extractHostname(rawUrl: string): string {
+    // Replace template variables like ${BASE_URL} before parsing
+    const cleaned = rawUrl.replace(/\$\{[^}]+\}/g, 'placeholder');
+    try {
+        return new URL(cleaned).hostname;
+    } catch {
+        return rawUrl.split('/')[0] ?? rawUrl;
+    }
+}
