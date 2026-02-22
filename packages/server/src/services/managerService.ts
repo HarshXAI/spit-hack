@@ -5,6 +5,7 @@
  */
 
 import OpenAI from 'openai';
+import { randomUUID } from 'crypto';
 import { getDb } from '../db/index.js';
 import { getNodes, getEdges, getSystemHealth } from './graphService.js';
 
@@ -188,3 +189,124 @@ export function getOnboardingPath(role: string) {
         }),
     };
 }
+
+// ── Team Management ────────────────────────────────────────────────────────────
+
+export interface TeamMember {
+    id: string;
+    name: string;
+    role: string;
+    online: boolean;
+    progress: number;
+    joinedAt: string;
+}
+
+export interface Team {
+    id: string;
+    name: string;
+    repo: string;
+    joinCode: string;
+    description: string;
+    color: string;
+    createdAt: string;
+    members: TeamMember[];
+}
+
+function generateJoinCode(): string {
+    return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function rowToTeam(row: Record<string, unknown>, members: TeamMember[]): Team {
+    return {
+        id: row.id as string,
+        name: row.name as string,
+        repo: row.repo as string,
+        joinCode: row.join_code as string,
+        description: row.description as string,
+        color: row.color as string,
+        createdAt: row.created_at as string,
+        members,
+    };
+}
+
+function membersForTeam(teamId: string): TeamMember[] {
+    const db = getDb();
+    return (db.prepare(`SELECT * FROM team_members WHERE team_id = ? ORDER BY joined_at ASC`).all(teamId) as Record<string, unknown>[])
+        .map(m => ({
+            id: m.id as string,
+            name: m.name as string,
+            role: m.role as string,
+            online: m.online === 1,
+            progress: m.progress as number,
+            joinedAt: m.joined_at as string,
+        }));
+}
+
+/** Return all teams with their members. */
+export function getTeams(): Team[] {
+    const db = getDb();
+    const rows = db.prepare(`SELECT * FROM teams ORDER BY created_at ASC`).all() as Record<string, unknown>[];
+    return rows.map(r => rowToTeam(r, membersForTeam(r.id as string)));
+}
+
+/** Create a new team and return it. */
+export function createTeam(input: { name: string; repo?: string; description?: string; color?: string }): Team {
+    const db = getDb();
+
+    // Ensure unique join code
+    let joinCode = generateJoinCode();
+    while (db.prepare(`SELECT 1 FROM teams WHERE join_code = ?`).get(joinCode)) {
+        joinCode = generateJoinCode();
+    }
+
+    const COLORS = ['#6366F1', '#16A34A', '#D97706', '#0052CC', '#DC2626', '#7C3AED', '#0891B2'];
+    const count = (db.prepare(`SELECT COUNT(*) as c FROM teams`).get() as { c: number }).c;
+    const color = input.color ?? COLORS[count % COLORS.length];
+
+    const id = randomUUID();
+    db.prepare(`
+        INSERT INTO teams (id, name, repo, join_code, description, color)
+        VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, input.name, input.repo ?? '—', joinCode, input.description ?? '', color);
+
+    return rowToTeam(
+        db.prepare(`SELECT * FROM teams WHERE id = ?`).get(id) as Record<string, unknown>,
+        [],
+    );
+}
+
+/** Delete a team (cascades to members). */
+export function deleteTeam(teamId: string): void {
+    const db = getDb();
+    db.prepare(`DELETE FROM teams WHERE id = ?`).run(teamId);
+}
+
+/** Regenerate a team's join code and return the new code. */
+export function regenTeamCode(teamId: string): string {
+    const db = getDb();
+    let joinCode = generateJoinCode();
+    while (db.prepare(`SELECT 1 FROM teams WHERE join_code = ? AND id != ?`).get(joinCode, teamId)) {
+        joinCode = generateJoinCode();
+    }
+    db.prepare(`UPDATE teams SET join_code = ?, updated_at = datetime('now') WHERE id = ?`).run(joinCode, teamId);
+    return joinCode;
+}
+
+/** Validate a 6-digit code and return the matching team (for engineers). */
+export function joinTeamByCode(joinCode: string): Team | null {
+    const db = getDb();
+    const row = db.prepare(`SELECT * FROM teams WHERE join_code = ?`).get(joinCode) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return rowToTeam(row, membersForTeam(row.id as string));
+}
+
+/** Add a member to a team (called after an engineer enters a valid code). */
+export function addTeamMember(teamId: string, input: { name: string; role?: string }): TeamMember {
+    const db = getDb();
+    const id = randomUUID();
+    db.prepare(`INSERT INTO team_members (id, team_id, name, role) VALUES (?, ?, ?, ?)`).run(
+        id, teamId, input.name, input.role ?? 'Engineer',
+    );
+    return (db.prepare(`SELECT * FROM team_members WHERE id = ?`).get(id) as Record<string, unknown>) as unknown as TeamMember;
+}
+

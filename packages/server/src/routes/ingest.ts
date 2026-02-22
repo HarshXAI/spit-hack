@@ -14,6 +14,7 @@ import {
   enqueueRepoIngest,
   enqueueCommitIngest,
 } from '../services/ingestService.js';
+import { ingestFromUrl } from '../services/seedService.js';
 import { subscribe } from '../sse/sseManager.js';
 import { ok, err } from '../types/index.js';
 
@@ -96,6 +97,35 @@ router.post('/commit', async (req: Request, res: Response): Promise<void> => {
       return;
     }
     const message = e instanceof Error ? e.message : 'Failed to enqueue commit ingest';
+    res.status(500).json(err(message));
+  }
+});
+
+// ── POST /api/ingest/github ───────────────────────────────────────────────────
+
+/**
+ * Dynamically ingest any public GitHub repo URL.
+ * Clones/pulls the repo, scans it, and upserts the result into the KG.
+ * Called by the onboarding screen when the user provides a GitHub URL.
+ *
+ * @param req.body - { repoUrl: string }
+ * @returns 200 with { services, deps, issues, repoUrl }
+ */
+router.post('/github', async (req: Request, res: Response): Promise<void> => {
+  const { repoUrl } = req.body as { repoUrl?: string };
+  if (!repoUrl || typeof repoUrl !== 'string') {
+    res.status(400).json(err('repoUrl is required'));
+    return;
+  }
+  if (!/^https:\/\/github\.com\//i.test(repoUrl)) {
+    res.status(400).json(err('repoUrl must be a GitHub HTTPS URL (https://github.com/...)'));
+    return;
+  }
+  try {
+    const result = await ingestFromUrl(repoUrl.trim());
+    res.status(200).json(ok(result));
+  } catch (e) {
+    const message = e instanceof Error ? e.message : 'Ingestion failed';
     res.status(500).json(err(message));
   }
 });

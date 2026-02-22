@@ -24,6 +24,8 @@ export const TABLES = [
     'qa_sessions',
     'activity_feed',
     'snapshots',
+    'teams',
+    'team_members',
 ] as const;
 
 export type TableName = (typeof TABLES)[number];
@@ -163,6 +165,29 @@ export function runMigrations(db: Database.Database): void {
       nodes      TEXT NOT NULL,             -- JSON: GraphNode[]
       edges      TEXT NOT NULL,             -- JSON: GraphEdge[]
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- ── TEAMS (manager-created, join-code gated) ─────────────────────
+    CREATE TABLE IF NOT EXISTS teams (
+      id          TEXT PRIMARY KEY,
+      name        TEXT NOT NULL,
+      repo        TEXT DEFAULT '—',
+      join_code   TEXT NOT NULL UNIQUE,     -- 6-digit numeric code
+      description TEXT DEFAULT '',
+      color       TEXT DEFAULT '#6366F1',
+      created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at  TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- ── TEAM MEMBERS ─────────────────────────────────────────────────
+    CREATE TABLE IF NOT EXISTS team_members (
+      id        TEXT PRIMARY KEY,
+      team_id   TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+      name      TEXT NOT NULL,
+      role      TEXT DEFAULT 'Engineer',
+      online    INTEGER DEFAULT 0,          -- 0 = offline, 1 = online
+      progress  INTEGER DEFAULT 0,          -- onboarding progress (0-7)
+      joined_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
   `);
 }
