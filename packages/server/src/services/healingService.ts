@@ -282,16 +282,18 @@ export async function createHealingPR(healingId: string, repoFullName: string): 
     const { data: ref } = await octokit.git.getRef({ owner, repo, ref: `heads/${defaultBranch}` });
     const baseSha = ref.object.sha;
 
-    // Create branch
-    const branchName = `kachow/heal-${pr.issue_type}-${Date.now()}`;
+    // Create branch — sanitize issue_type for valid git ref name
+    const safeName = pr.issue_type.replace(/[^a-zA-Z0-9_-]/g, '-').replace(/-+/g, '-').slice(0, 40);
+    const branchName = `kachow/heal-${safeName}-${Date.now()}`;
     await octokit.git.createRef({
         owner, repo,
         ref: `refs/heads/${branchName}`,
         sha: baseSha,
     });
 
-    // Create/update file with patch
-    const filePath = `kachow-patches/${pr.service_name}/${pr.issue_type}.patch.ts`;
+    // Create/update file with patch — sanitize path too
+    const safeIssueType = pr.issue_type.replace(/[^a-zA-Z0-9_-]/g, '-').replace(/-+/g, '-');
+    const filePath = `kachow-patches/${pr.service_name}/${safeIssueType}.patch.ts`;
     await octokit.repos.createOrUpdateFileContents({
         owner, repo,
         path: filePath,

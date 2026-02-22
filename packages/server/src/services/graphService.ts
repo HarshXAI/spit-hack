@@ -167,43 +167,67 @@ function parseEndpoints(raw: string | null): string[] {
 /**
  * Returns all service nodes with computed layout coordinates and connection counts.
  * When teamName is supplied only that team's services + their external references are returned.
+ * When teamId is supplied, filters by FK team_id for multi-tenant isolation.
  * Used by GET /api/graph/nodes.
  *
- * @param teamName - Optional team name to filter services by
+ * @param teamName - Optional team name (label) to filter services by
+ * @param teamId   - Optional team ID (FK) for multi-tenant scoping
  * @returns Array of GraphNode objects sorted by health score descending
  */
-export function getNodes(teamName?: string): GraphNode[] {
+export function getNodes(teamName?: string, teamId?: string): GraphNode[] {
     const db = getDb();
 
-    const nodeQuery = db.prepare<unknown[], ServiceRow>(`
-    SELECT
-      s.id, s.name, s.team, s.language, s.health_score, s.health_tier,
-      s.repo_url, s.doc_coverage, s.test_coverage, s.last_ingested,
-      (SELECT COUNT(*) FROM dependencies WHERE source_id = s.id) +
-      (SELECT COUNT(*) FROM dependencies WHERE target_id = s.id) AS connection_count
-    FROM services s
-    WHERE s.is_external = 0 AND s.team = ?
-    ORDER BY s.health_score DESC
-  `);
-
-    const allNodesQuery = db.prepare<[], ServiceRow>(`
-    SELECT
-      s.id, s.name, s.team, s.language, s.health_score, s.health_tier,
-      s.repo_url, s.doc_coverage, s.test_coverage, s.last_ingested,
-      (SELECT COUNT(*) FROM dependencies WHERE source_id = s.id) +
-      (SELECT COUNT(*) FROM dependencies WHERE target_id = s.id) AS connection_count
-    FROM services s
-    WHERE s.is_external = 0
-    ORDER BY s.health_score DESC
-  `);
-
-    // Internal services — fall back to all if no nodes match the requested team
     let rows: ServiceRow[];
-    if (teamName) {
-        rows = nodeQuery.all(teamName);
-        if (rows.length === 0) rows = allNodesQuery.all();
+
+    if (teamId) {
+        // Multi-tenant: filter by FK
+        rows = db.prepare<unknown[], ServiceRow>(`
+            SELECT s.id, s.name, s.team, s.language, s.health_score, s.health_tier,
+              s.repo_url, s.doc_coverage, s.test_coverage, s.last_ingested,
+              (SELECT COUNT(*) FROM dependencies WHERE source_id = s.id) +
+              (SELECT COUNT(*) FROM dependencies WHERE target_id = s.id) AS connection_count
+            FROM services s WHERE s.is_external = 0 AND s.team_id = ?
+            ORDER BY s.health_score DESC
+        `).all(teamId);
+        if (rows.length === 0) {
+            // fallback to all
+            rows = db.prepare<[], ServiceRow>(`
+                SELECT s.id, s.name, s.team, s.language, s.health_score, s.health_tier,
+                  s.repo_url, s.doc_coverage, s.test_coverage, s.last_ingested,
+                  (SELECT COUNT(*) FROM dependencies WHERE source_id = s.id) +
+                  (SELECT COUNT(*) FROM dependencies WHERE target_id = s.id) AS connection_count
+                FROM services s WHERE s.is_external = 0
+                ORDER BY s.health_score DESC
+            `).all();
+        }
+    } else if (teamName) {
+        rows = db.prepare<unknown[], ServiceRow>(`
+            SELECT s.id, s.name, s.team, s.language, s.health_score, s.health_tier,
+              s.repo_url, s.doc_coverage, s.test_coverage, s.last_ingested,
+              (SELECT COUNT(*) FROM dependencies WHERE source_id = s.id) +
+              (SELECT COUNT(*) FROM dependencies WHERE target_id = s.id) AS connection_count
+            FROM services s WHERE s.is_external = 0 AND s.team = ?
+            ORDER BY s.health_score DESC
+        `).all(teamName);
+        if (rows.length === 0) {
+            rows = db.prepare<[], ServiceRow>(`
+                SELECT s.id, s.name, s.team, s.language, s.health_score, s.health_tier,
+                  s.repo_url, s.doc_coverage, s.test_coverage, s.last_ingested,
+                  (SELECT COUNT(*) FROM dependencies WHERE source_id = s.id) +
+                  (SELECT COUNT(*) FROM dependencies WHERE target_id = s.id) AS connection_count
+                FROM services s WHERE s.is_external = 0
+                ORDER BY s.health_score DESC
+            `).all();
+        }
     } else {
-        rows = allNodesQuery.all();
+        rows = db.prepare<[], ServiceRow>(`
+            SELECT s.id, s.name, s.team, s.language, s.health_score, s.health_tier,
+              s.repo_url, s.doc_coverage, s.test_coverage, s.last_ingested,
+              (SELECT COUNT(*) FROM dependencies WHERE source_id = s.id) +
+              (SELECT COUNT(*) FROM dependencies WHERE target_id = s.id) AS connection_count
+            FROM services s WHERE s.is_external = 0
+            ORDER BY s.health_score DESC
+        `).all();
     }
 
     const internalIds = rows.map(r => r.id);
@@ -271,21 +295,33 @@ export function getNodes(teamName?: string): GraphNode[] {
  * that team are returned.
  * Used by GET /api/graph/edges.
  *
- * @param teamName - Optional team name to filter edges by
+ * @param teamName - Optional team name (label) to filter edges by
+ * @param teamId   - Optional team ID (FK) for multi-tenant scoping
  * @returns Array of GraphEdge objects
  */
-export function getEdges(teamName?: string): GraphEdge[] {
+export function getEdges(teamName?: string, teamId?: string): GraphEdge[] {
     const db = getDb();
 
     let rows: DepRow[];
-    if (teamName) {
+    if (teamId) {
+        rows = db.prepare<unknown[], DepRow>(`
+            SELECT d.id, d.source_id, d.target_id, d.type, d.endpoints, d.strength
+            FROM dependencies d
+            WHERE d.source_id IN (SELECT id FROM services WHERE team_id = ?)
+               OR d.target_id IN (SELECT id FROM services WHERE team_id = ?)
+        `).all(teamId, teamId);
+        if (rows.length === 0) {
+            rows = db.prepare<[], DepRow>(
+                'SELECT id, source_id, target_id, type, endpoints, strength FROM dependencies',
+            ).all();
+        }
+    } else if (teamName) {
         rows = db.prepare<unknown[], DepRow>(`
             SELECT d.id, d.source_id, d.target_id, d.type, d.endpoints, d.strength
             FROM dependencies d
             WHERE d.source_id IN (SELECT id FROM services WHERE team = ?)
                OR d.target_id IN (SELECT id FROM services WHERE team = ?)
         `).all(teamName, teamName);
-        // Fall back to all edges if the team has no matching services
         if (rows.length === 0) {
             rows = db.prepare<[], DepRow>(
                 'SELECT id, source_id, target_id, type, endpoints, strength FROM dependencies',
@@ -405,27 +441,33 @@ export function getNodeDetail(id: string): GraphNodeDetail | null {
  *
  * Returns a flat CriticalIssue[] sorted by severity (critical → warning → info).
  */
-export function getCriticalIssues(): CriticalIssue[] {
+export function getCriticalIssues(teamId?: string): CriticalIssue[] {
     const db = getDb();
     const issues: CriticalIssue[] = [];
 
     // ── 1) Agent Knowledge Graph health issues + self-healing ─────────────────
 
-    // Service lookup for enrichment
+    // Service lookup for enrichment (scoped by team when provided)
     const svcMap = new Map<string, { name: string; healthScore: number; healthTier: HealthTier }>();
-    const svcRows = db.prepare<[], { id: string; name: string; health_score: number; health_tier: string }>(
-        'SELECT id, name, health_score, health_tier FROM services WHERE is_external = 0',
-    ).all();
+    const svcQuery = teamId
+        ? 'SELECT id, name, health_score, health_tier FROM services WHERE is_external = 0 AND team_id = ?'
+        : 'SELECT id, name, health_score, health_tier FROM services WHERE is_external = 0';
+    const svcRows = teamId
+        ? db.prepare<unknown[], { id: string; name: string; health_score: number; health_tier: string }>(svcQuery).all(teamId)
+        : db.prepare<[], { id: string; name: string; health_score: number; health_tier: string }>(svcQuery).all();
     for (const s of svcRows) svcMap.set(s.id, { name: s.name, healthScore: s.health_score, healthTier: s.health_tier as HealthTier });
 
     // Also build a name→id reverse lookup (agent KG uses service names, not IDs)
     const nameToId = new Map<string, string>();
     for (const s of svcRows) nameToId.set(s.name.toLowerCase(), s.id);
 
-    // Read the latest agent KG from knowledge_graph table
-    const kgRow = db.prepare<[], { nodes: string; self_healing: string }>(
-        `SELECT nodes, self_healing FROM knowledge_graph ORDER BY created_at DESC LIMIT 1`,
-    ).get();
+    // Read the latest agent KG from knowledge_graph table (team-scoped when provided)
+    const kgQuery = teamId
+        ? `SELECT nodes, self_healing FROM knowledge_graph WHERE team_id = ? ORDER BY created_at DESC LIMIT 1`
+        : `SELECT nodes, self_healing FROM knowledge_graph ORDER BY created_at DESC LIMIT 1`;
+    const kgRow = teamId
+        ? db.prepare<unknown[], { nodes: string; self_healing: string }>(kgQuery).get(teamId)
+        : db.prepare<[], { nodes: string; self_healing: string }>(kgQuery).get();
 
     if (kgRow) {
         try {
@@ -491,10 +533,14 @@ export function getCriticalIssues(): CriticalIssue[] {
         id: string; service_id: string; issue_type: string; explanation: string;
         status: string;
     }
-    const healingRows = db.prepare<[], HealingRow>(
-        `SELECT id, service_id, issue_type, explanation, status
-         FROM healing_prs WHERE status IN ('detected', 'open')`,
-    ).all();
+    const healingQuery = teamId
+        ? `SELECT id, service_id, issue_type, explanation, status
+           FROM healing_prs WHERE status IN ('detected', 'open') AND team_id = ?`
+        : `SELECT id, service_id, issue_type, explanation, status
+           FROM healing_prs WHERE status IN ('detected', 'open')`;
+    const healingRows = teamId
+        ? db.prepare<unknown[], HealingRow>(healingQuery).all(teamId)
+        : db.prepare<[], HealingRow>(healingQuery).all();
     for (const h of healingRows) {
         const svc = svcMap.get(h.service_id);
         // Avoid duplicate if agent KG already has the same issue text
@@ -518,15 +564,25 @@ export function getCriticalIssues(): CriticalIssue[] {
         }
     }
 
-    // ── 3) Open incidents ─────────────────────────────────────────────────────
+    // ── 3) Open incidents (scoped through service FK when teamId provided) ──
 
-    const incidentRows = db.prepare<[], {
-        id: string; service_id: string; severity: string; title: string;
-        status: string; occurred_at: string;
-    }>(
-        `SELECT id, service_id, severity, title, status, occurred_at
-         FROM incidents WHERE status != 'resolved' ORDER BY occurred_at DESC LIMIT 30`,
-    ).all();
+    const incidentQuery = teamId
+        ? `SELECT i.id, i.service_id, i.severity, i.title, i.status, i.occurred_at
+           FROM incidents i
+           JOIN services s ON s.id = i.service_id
+           WHERE i.status != 'resolved' AND s.team_id = ?
+           ORDER BY i.occurred_at DESC LIMIT 30`
+        : `SELECT id, service_id, severity, title, status, occurred_at
+           FROM incidents WHERE status != 'resolved' ORDER BY occurred_at DESC LIMIT 30`;
+    const incidentRows = teamId
+        ? db.prepare<unknown[], {
+            id: string; service_id: string; severity: string; title: string;
+            status: string; occurred_at: string;
+        }>(incidentQuery).all(teamId)
+        : db.prepare<[], {
+            id: string; service_id: string; severity: string; title: string;
+            status: string; occurred_at: string;
+        }>(incidentQuery).all();
     for (const inc of incidentRows) {
         const svc = svcMap.get(inc.service_id);
         issues.push({
@@ -576,10 +632,15 @@ function classifyCategory(text: string): string {
  *
  * @returns SystemHealth object with score breakdown
  */
-export function getSystemHealth(): SystemHealth {
+export function getSystemHealth(teamId?: string): SystemHealth {
     const db = getDb();
 
-    const row = db.prepare<[], HealthRow>(`
+    const baseWhere = teamId
+        ? 'WHERE is_external = 0 AND team_id = ?'
+        : 'WHERE is_external = 0';
+    const params = teamId ? [teamId] : [];
+
+    const row = db.prepare<unknown[], HealthRow>(`
     SELECT
       ROUND(AVG(health_score), 1)                                        AS overall,
       COUNT(*)                                                            AS total,
@@ -588,12 +649,18 @@ export function getSystemHealth(): SystemHealth {
       SUM(CASE WHEN health_tier = 'healthy'  THEN 1 ELSE 0 END)         AS healthy,
       MAX(last_ingested)                                                  AS last_updated
     FROM services
-    WHERE is_external = 0
-  `).get();
+    ${baseWhere}
+  `).get(...params);
 
-    const edgeCount = (db.prepare<[], { cnt: number }>(
-        `SELECT COUNT(*) AS cnt FROM dependencies`
-    ).get()?.cnt) ?? 0;
+    const edgeCount = teamId
+        ? (db.prepare<unknown[], { cnt: number }>(
+            `SELECT COUNT(*) AS cnt FROM dependencies d
+             WHERE EXISTS (SELECT 1 FROM services s WHERE s.id = d.source_id AND s.team_id = ?)
+                OR EXISTS (SELECT 1 FROM services s WHERE s.id = d.target_id AND s.team_id = ?)`
+        ).get(teamId, teamId)?.cnt ?? 0)
+        : (db.prepare<[], { cnt: number }>(
+            `SELECT COUNT(*) AS cnt FROM dependencies`
+        ).get()?.cnt ?? 0);
 
     return {
         overallScore: row?.overall ?? 0,
@@ -648,19 +715,20 @@ export function getSnapshot(version: string): GraphSnapshot | null {
  * Called by the ingest worker after a successful full scan.
  *
  * @param version - Snapshot version label (git tag or ISO timestamp)
+ * @param teamId  - Optional team ID for multi-tenant scoping
  * @returns void
  */
-export function saveSnapshot(version: string): void {
+export function saveSnapshot(version: string, teamId?: string): void {
     const db = getDb();
-    const nodes = getNodes();
+    const nodes = teamId ? getNodes(undefined, teamId) : getNodes();
     const edges = getEdges();
 
     db.prepare(`
-    INSERT INTO snapshots (id, version, nodes, edges)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(version) DO UPDATE SET
+    INSERT INTO snapshots (id, version, team_id, nodes, edges)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(version, team_id) DO UPDATE SET
       nodes = excluded.nodes,
       edges = excluded.edges,
       created_at = datetime('now')
-  `).run(randomUUID(), version, JSON.stringify(nodes), JSON.stringify(edges));
+  `).run(randomUUID(), version, teamId ?? null, JSON.stringify(nodes), JSON.stringify(edges));
 }
