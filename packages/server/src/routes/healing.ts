@@ -115,6 +115,7 @@ const ApplyFixSchema = z.object({
 });
 
 router.post('/apply-fix', async (req: Request, res: Response): Promise<void> => {
+    console.log('[apply-fix] Received request:', JSON.stringify(req.body).slice(0, 200));
     const parse = ApplyFixSchema.safeParse(req.body);
     if (!parse.success) {
         res.status(400).json(err(parse.error.errors.map(e => e.message).join('; ')));
@@ -130,17 +131,24 @@ router.post('/apply-fix', async (req: Request, res: Response): Promise<void> => 
         // Step 2: Generate GPT-4o patch
         const patch = await generatePatch(healingId);
 
-        // Step 3: Optionally create GitHub PR
+        // Step 3: Optionally create GitHub PR (don't let PR failure kill the whole response)
         let prResult = null;
+        let prError: string | null = null;
         if (openPR && repoFullName) {
-            prResult = await createHealingPR(healingId, repoFullName);
+            try {
+                prResult = await createHealingPR(healingId, repoFullName);
+            } catch (prErr) {
+                prError = prErr instanceof Error ? prErr.message : 'PR creation failed';
+                console.error('[apply-fix] PR creation failed:', prError);
+            }
         }
 
         res.status(201).json(ok({
             healingId,
             patch,
             pr: prResult,
-            status: prResult ? 'pr-open' : 'patch-ready',
+            prError,
+            status: prResult ? 'pr-open' : prError ? 'patch-ready-pr-failed' : 'patch-ready',
         }));
     } catch (e) {
         const msg = e instanceof Error ? e.message : 'Fix generation failed';
