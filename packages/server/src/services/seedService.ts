@@ -38,10 +38,24 @@ function repoSlug(repoUrl: string): string {
 }
 
 /**
+ * Injects the GitHub token into an HTTPS GitHub URL so private repos can be
+ * cloned without interactive prompts.
+ * "https://github.com/owner/repo" → "https://<token>@github.com/owner/repo"
+ * If no token is provided the URL is returned unchanged (public repos still work).
+ */
+function injectToken(repoUrl: string, token: string | undefined): string {
+    if (!token) return repoUrl;
+    return repoUrl.replace(/^https:\/\/github\.com\//, `https://${token}@github.com/`);
+}
+
+/**
  * Clones or pulls the repo into <tmpDir>/kachow-seeds/<slug>.
  * Returns the absolute path to the local clone.
  */
 function cloneOrPull(repoUrl: string): string {
+    const token = process.env.GITHUB_TOKEN;
+    const authUrl = injectToken(repoUrl, token);
+
     const slug = repoSlug(repoUrl);
     const seedsDir = path.join(os.tmpdir(), 'kachow-seeds');
     const cloneDir = path.join(seedsDir, slug);
@@ -51,15 +65,17 @@ function cloneOrPull(repoUrl: string): string {
     if (fs.existsSync(path.join(cloneDir, '.git'))) {
         console.log(`[Seed] Pulling latest for ${slug}...`);
         try {
+            // Update the remote URL with the current token in case it changed
+            execSync(`git remote set-url origin "${authUrl}"`, { cwd: cloneDir, stdio: 'pipe' });
             execSync('git pull --ff-only', { cwd: cloneDir, stdio: 'pipe' });
         } catch {
             // Non-fast-forward or dirty — just continue with what we have
             console.warn('[Seed] git pull skipped (non-ff or dirty tree) — using existing clone.');
         }
     } else {
-        console.log(`[Seed] Cloning ${repoUrl} → ${cloneDir}`);
+        console.log(`[Seed] Cloning ${repoUrl} → ${cloneDir}${token ? ' (authenticated)' : ''}`);
         fs.mkdirSync(cloneDir, { recursive: true });
-        execSync(`git clone --depth=1 "${repoUrl}" "${cloneDir}"`, { stdio: 'pipe' });
+        execSync(`git clone --depth=1 "${authUrl}" "${cloneDir}"`, { stdio: 'pipe' });
     }
 
     return cloneDir;
