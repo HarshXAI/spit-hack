@@ -17,6 +17,7 @@ import {
 import { ingestFromUrl } from '../services/seedService.js';
 import { subscribe } from '../sse/sseManager.js';
 import { ok, err } from '../types/index.js';
+import { getDb } from '../db/index.js';
 
 const router: ExpressRouter = Router();
 
@@ -112,17 +113,33 @@ router.post('/commit', async (req: Request, res: Response): Promise<void> => {
  * @returns 200 with { services, deps, issues, repoUrl }
  */
 router.post('/github', async (req: Request, res: Response): Promise<void> => {
-  const { repoUrl } = req.body as { repoUrl?: string };
-  if (!repoUrl || typeof repoUrl !== 'string') {
+  const raw = (req.body as { repoUrl?: string }).repoUrl;
+  if (!raw || typeof raw !== 'string') {
     res.status(400).json(err('repoUrl is required'));
     return;
   }
+  // Normalise: accept "github.com/..." or full "https://github.com/..."
+  let repoUrl = raw.trim();
+  if (!/^https?:\/\//i.test(repoUrl)) repoUrl = `https://${repoUrl}`;
   if (!/^https:\/\/github\.com\//i.test(repoUrl)) {
-    res.status(400).json(err('repoUrl must be a GitHub HTTPS URL (https://github.com/...)'));
+    res.status(400).json(err('repoUrl must point to a GitHub repository (github.com/...)'));
     return;
   }
   try {
-    const result = await ingestFromUrl(repoUrl.trim());
+    // Wipe all stale graph data so the KG reflects only this repo
+    const db = getDb();
+    db.exec(`
+      DELETE FROM activity_feed;
+      DELETE FROM healing_prs;
+      DELETE FROM adrs;
+      DELETE FROM impact_analyses;
+      DELETE FROM endpoints;
+      DELETE FROM dependencies;
+      DELETE FROM services;
+      DELETE FROM snapshots;
+    `);
+
+    const result = await ingestFromUrl(repoUrl);
     res.status(200).json(ok(result));
   } catch (e) {
     const message = e instanceof Error ? e.message : 'Ingestion failed';
