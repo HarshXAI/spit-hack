@@ -14,20 +14,20 @@ import type Database from 'better-sqlite3';
  * Used by tests to assert every table was created.
  */
 export const TABLES = [
-    'services',
-    'dependencies',
-    'incidents',
-    'endpoints',
-    'impact_analyses',
-    'adrs',
-    'healing_prs',
-    'qa_sessions',
-    'activity_feed',
-    'snapshots',
-    'teams',
-    'team_members',
-    'agent_analyses',
-    'knowledge_graph',
+  'services',
+  'dependencies',
+  'incidents',
+  'endpoints',
+  'impact_analyses',
+  'adrs',
+  'healing_prs',
+  'qa_sessions',
+  'activity_feed',
+  'snapshots',
+  'teams',
+  'team_members',
+  'agent_analyses',
+  'knowledge_graph',
 ] as const;
 
 export type TableName = (typeof TABLES)[number];
@@ -41,7 +41,7 @@ export type TableName = (typeof TABLES)[number];
  * @throws If SQLite reports a syntax or constraint error in the DDL
  */
 export function runMigrations(db: Database.Database): void {
-    db.exec(`
+  db.exec(`
     -- ── TEAMS (manager-created, join-code gated) ─────────────────────
     -- Created FIRST because services references teams(id)
     CREATE TABLE IF NOT EXISTS teams (
@@ -227,23 +227,23 @@ export function runMigrations(db: Database.Database): void {
     );
   `);
 
-    // ── Run additive migrations for existing databases ────────────────────────
-    // These are safe to run repeatedly — they only add columns if missing.
-    const safeAddColumn = (table: string, column: string, definition: string) => {
-        try {
-            db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-        } catch {
-            // Column already exists — this is expected and safe to ignore
-        }
-    };
+  // ── Run additive migrations for existing databases ────────────────────────
+  // These are safe to run repeatedly — they only add columns if missing.
+  const safeAddColumn = (table: string, column: string, definition: string) => {
+    try {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    } catch {
+      // Column already exists — this is expected and safe to ignore
+    }
+  };
 
-    // Multi-tenancy columns for existing DBs
-    safeAddColumn('services', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
-    safeAddColumn('impact_analyses', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
-    safeAddColumn('healing_prs', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
-    safeAddColumn('qa_sessions', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
-    safeAddColumn('activity_feed', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
-    safeAddColumn('snapshots', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
-    safeAddColumn('agent_analyses', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
-    safeAddColumn('knowledge_graph', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
+  // Multi-tenancy columns for existing DBs
+  safeAddColumn('services', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
+  safeAddColumn('impact_analyses', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
+  safeAddColumn('healing_prs', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
+  safeAddColumn('qa_sessions', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
+  safeAddColumn('activity_feed', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
+  safeAddColumn('snapshots', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
+  safeAddColumn('agent_analyses', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
+  safeAddColumn('knowledge_graph', 'team_id', 'TEXT REFERENCES teams(id) ON DELETE CASCADE');
 }
