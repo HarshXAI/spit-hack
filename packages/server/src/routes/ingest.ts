@@ -14,8 +14,10 @@ import {
   enqueueRepoIngest,
   enqueueCommitIngest,
 } from '../services/ingestService.js';
+import { ingestFromUrl } from '../services/seedService.js';
 import { subscribe } from '../sse/sseManager.js';
 import { ok, err } from '../types/index.js';
+import { getDb } from '../db/index.js';
 
 const router: ExpressRouter = Router();
 
@@ -96,6 +98,53 @@ router.post('/commit', async (req: Request, res: Response): Promise<void> => {
       return;
     }
     const message = e instanceof Error ? e.message : 'Failed to enqueue commit ingest';
+    res.status(500).json(err(message));
+  }
+});
+
+// ── POST /api/ingest/github ───────────────────────────────────────────────────
+
+/**
+ * Dynamically ingest any public GitHub repo URL.
+ * Clones/pulls the repo, scans it, and upserts the result into the KG.
+ * Called by the onboarding screen when the user provides a GitHub URL.
+ *
+ * @param req.body - { repoUrl: string }
+ * @returns 200 with { services, deps, issues, repoUrl }
+ */
+router.post('/github', async (req: Request, res: Response): Promise<void> => {
+  const raw = (req.body as { repoUrl?: string }).repoUrl;
+  if (!raw || typeof raw !== 'string') {
+    res.status(400).json(err('repoUrl is required'));
+    return;
+  }
+  // Normalise: accept "github.com/..." or full "https://github.com/..."
+  let repoUrl = raw.trim();
+  if (!/^https?:\/\//i.test(repoUrl)) repoUrl = `https://${repoUrl}`;
+  if (!/^https:\/\/github\.com\//i.test(repoUrl)) {
+    res.status(400).json(err('repoUrl must point to a GitHub repository (github.com/...)'));
+    return;
+  }
+  const teamName = (req.body as { teamName?: string }).teamName?.trim() || undefined;
+
+  try {
+    // Wipe all stale graph data so the KG reflects only this repo
+    const db = getDb();
+    db.exec(`
+      DELETE FROM activity_feed;
+      DELETE FROM healing_prs;
+      DELETE FROM adrs;
+      DELETE FROM impact_analyses;
+      DELETE FROM endpoints;
+      DELETE FROM dependencies;
+      DELETE FROM services;
+      DELETE FROM snapshots;
+    `);
+
+    const result = await ingestFromUrl(repoUrl, teamName);
+    res.status(200).json(ok(result));
+  } catch (e) {
+    const message = e instanceof Error ? e.message : 'Ingestion failed';
     res.status(500).json(err(message));
   }
 });

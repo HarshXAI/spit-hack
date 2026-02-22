@@ -7,6 +7,7 @@
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getIngestQueue } from '../queues/ingestQueue.js';
+import { runIngestDirect, runCommitDirect } from '../workers/ingestWorker.js';
 import { getDb } from '../db/index.js';
 
 // ── Zod schemas ───────────────────────────────────────────────────────────────
@@ -71,11 +72,19 @@ export async function enqueueRepoIngest(
     const jobId = randomUUID();
     const queue = getIngestQueue();
 
-    await queue.add(
-        'ingest-repo',
-        { jobId, repoPath: input.repoPath, repoUrl: input.repoUrl, team: input.team },
-        { jobId },
-    );
+    if (queue) {
+        await queue.add(
+            'ingest-repo',
+            { jobId, repoPath: input.repoPath, repoUrl: input.repoUrl, team: input.team },
+            { jobId },
+        );
+    } else {
+        // Redis not available — run in-process (fire and forget, SSE still works)
+        setImmediate(() => {
+            runIngestDirect({ jobId, repoPath: input.repoPath, repoUrl: input.repoUrl, team: input.team })
+                .catch((e: unknown) => console.error('[IngestService] Direct run failed:', e));
+        });
+    }
 
     return {
         jobId,
@@ -113,16 +122,23 @@ export async function enqueueCommitIngest(
     const jobId = randomUUID();
     const queue = getIngestQueue();
 
-    await queue.add(
-        'ingest-commit',
-        {
-            jobId,
-            repoId: input.repoId,
-            commitHash: input.commitHash,
-            changedFiles: input.changedFiles,
-        },
-        { jobId },
-    );
+    if (queue) {
+        await queue.add(
+            'ingest-commit',
+            {
+                jobId,
+                repoId: input.repoId,
+                commitHash: input.commitHash,
+                changedFiles: input.changedFiles,
+            },
+            { jobId },
+        );
+    } else {
+        setImmediate(() => {
+            runCommitDirect({ jobId, repoId: input.repoId, commitHash: input.commitHash, changedFiles: input.changedFiles })
+                .catch((e: unknown) => console.error('[IngestService] Direct commit run failed:', e));
+        });
+    }
 
     return {
         nodesUpdated: 1,
@@ -132,13 +148,14 @@ export async function enqueueCommitIngest(
 
 /**
  * Checks if a BullMQ job exists and returns its current state.
- * Used by the SSE route to validate the jobId before opening a stream.
+ * Returns 'in-process' when Redis is disabled.
  *
  * @param jobId - UUID of the job to look up
  * @returns Job state string or null if not found
  */
 export async function getJobState(jobId: string): Promise<string | null> {
     const queue = getIngestQueue();
+    if (!queue) return 'active'; // Redis disabled — assume active
     const job = await queue.getJob(jobId);
     if (!job) return null;
     return job.getState();

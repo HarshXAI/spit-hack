@@ -11,6 +11,7 @@ import { getDb } from './db/index.js';
 import { startIngestWorker, stopIngestWorker } from './workers/ingestWorker.js';
 import { closeIngestQueue } from './queues/ingestQueue.js';
 import { closeRedis } from './queues/redis.js';
+import { seedOnStartup } from './services/seedService.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 
@@ -25,6 +26,8 @@ const server = app.listen(PORT, () => {
     console.log(`   Ingest:    POST http://localhost:${PORT}/api/ingest/repo`);
     console.log(`   SSE:       GET  http://localhost:${PORT}/api/ingest/status/:jobId`);
     console.log(`   Frontend:  http://localhost:5173`);
+    // Auto-seed knowledge graph from SEED_REPO_URL (non-blocking)
+    void seedOnStartup();
 });
 
 // Graceful shutdown — drain BullMQ worker before exiting

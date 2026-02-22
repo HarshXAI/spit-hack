@@ -4,7 +4,7 @@
  */
 
 import { Queue } from 'bullmq';
-import { getRedis } from './redis.js';
+import { getRedis, isRedisDisabled } from './redis.js';
 
 /** Payload for a full repo ingest job. */
 export interface IngestJobData {
@@ -28,14 +28,17 @@ let _ingestQueue: Queue<AnyIngestJobData> | null = null;
 
 /**
  * Returns (and lazily creates) the ingest BullMQ queue.
- * The queue is only created once — subsequent calls return the cached instance.
+ * Returns null when Redis is disabled — callers should run jobs in-process instead.
  *
- * @returns BullMQ Queue for ingestion jobs
+ * @returns BullMQ Queue for ingestion jobs, or null if Redis is disabled
  */
-export function getIngestQueue(): Queue<AnyIngestJobData> {
+export function getIngestQueue(): Queue<AnyIngestJobData> | null {
+    if (isRedisDisabled()) return null;
+    const redis = getRedis();
+    if (!redis) return null;
     if (!_ingestQueue) {
         _ingestQueue = new Queue<AnyIngestJobData>('ingest', {
-            connection: getRedis(),
+            connection: redis,
             defaultJobOptions: {
                 attempts: 2,
                 backoff: { type: 'exponential', delay: 3000 },
