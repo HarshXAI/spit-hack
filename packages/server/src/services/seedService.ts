@@ -72,6 +72,7 @@ export interface IngestFromUrlResult {
     deps: number;
     issues: number;
     repoUrl: string;
+    teamId: string | null;
 }
 
 /**
@@ -80,9 +81,10 @@ export interface IngestFromUrlResult {
  *
  * @param repoUrl   - Full GitHub HTTPS URL to clone/scan
  * @param teamName  - Optional team name to tag all ingested services with
+ * @param teamId    - Optional team ID for multi-tenant scoping
  */
-export async function ingestFromUrl(repoUrl: string, teamName?: string): Promise<IngestFromUrlResult> {
-    console.log(`\n[Seed] 🌱 Ingesting from ${repoUrl}`);
+export async function ingestFromUrl(repoUrl: string, teamName?: string, teamId?: string): Promise<IngestFromUrlResult> {
+    console.log(`\n[Seed] 🌱 Ingesting from ${repoUrl}${teamId ? ` (team: ${teamId})` : ''}`);
 
     const cloneDir = cloneOrPull(repoUrl);   // throws on git error
 
@@ -91,14 +93,15 @@ export async function ingestFromUrl(repoUrl: string, teamName?: string): Promise
 
     const upsertService = db.prepare(`
         INSERT INTO services
-          (id, name, repo_url, repo_subpath, team, language, health_score, health_tier,
+          (id, name, repo_url, repo_subpath, team, team_id, language, health_score, health_tier,
            doc_coverage, test_coverage, last_commit, last_ingested)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
           name          = excluded.name,
           repo_url      = excluded.repo_url,
           repo_subpath  = excluded.repo_subpath,
           team          = excluded.team,
+          team_id       = excluded.team_id,
           language      = excluded.language,
           health_score  = excluded.health_score,
           health_tier   = excluded.health_tier,
@@ -126,14 +129,15 @@ export async function ingestFromUrl(repoUrl: string, teamName?: string): Promise
     `);
 
     const upsertStub = db.prepare(`
-        INSERT INTO services (id, name, health_score, health_tier, doc_coverage, test_coverage, is_external)
-        VALUES (?, ?, 0, 'critical', 0, 0, 1)
+        INSERT INTO services (id, name, health_score, health_tier, doc_coverage, test_coverage, is_external, team_id)
+        VALUES (?, ?, 0, 'critical', 0, 0, 1, ?)
         ON CONFLICT(id) DO NOTHING
     `);
 
     for (const svc of result.services) {
         upsertService.run(
             svc.id, svc.name, svc.repoUrl, svc.repoSubpath, svc.team,
+            teamId ?? null,
             svc.language,
             svc.healthScore, toHealthTier(svc.healthScore),
             svc.docCoverage, svc.testCoverage, svc.lastCommit,
@@ -157,24 +161,24 @@ export async function ingestFromUrl(repoUrl: string, teamName?: string): Promise
                  AND (name = ? OR name LIKE ? OR name LIKE ?) LIMIT 1`,
             ).get(name, `${name}-%`, `%-${name}`) as { id: string } | undefined;
             targetId = found?.id ?? serviceIdFromName(name);
-            if (!found) upsertStub.run(targetId, name);
+            if (!found) upsertStub.run(targetId, name, teamId ?? null);
 
         } else if (raw.startsWith('amqp:') || raw.startsWith('kafka:') || raw.startsWith('nats:')) {
             targetId = serviceIdFromName(raw);
             const label = raw.replace('amqp:', 'rabbitmq:');
             db.prepare(
-                `INSERT INTO services (id, name, health_score, health_tier, doc_coverage, test_coverage, is_external, language)
-                 VALUES (?, ?, 100, 'healthy', 0, 0, 1, 'infra')
+                `INSERT INTO services (id, name, health_score, health_tier, doc_coverage, test_coverage, is_external, language, team_id)
+                 VALUES (?, ?, 100, 'healthy', 0, 0, 1, 'infra', ?)
                  ON CONFLICT(id) DO NOTHING`,
-            ).run(targetId, label);
+            ).run(targetId, label, teamId ?? null);
 
         } else if (raw.startsWith('infra:')) {
             targetId = serviceIdFromName(raw);
             db.prepare(
-                `INSERT INTO services (id, name, health_score, health_tier, doc_coverage, test_coverage, is_external, language)
-                 VALUES (?, ?, 100, 'healthy', 0, 0, 1, 'infra')
+                `INSERT INTO services (id, name, health_score, health_tier, doc_coverage, test_coverage, is_external, language, team_id)
+                 VALUES (?, ?, 100, 'healthy', 0, 0, 1, 'infra', ?)
                  ON CONFLICT(id) DO NOTHING`,
-            ).run(targetId, raw.slice(6));
+            ).run(targetId, raw.slice(6), teamId ?? null);
 
         } else if (
             raw.includes('${') || raw.startsWith('$') ||
@@ -189,7 +193,7 @@ export async function ingestFromUrl(repoUrl: string, teamName?: string): Promise
                  AND (id = ? OR name = ? OR name LIKE ?) LIMIT 1`,
             ).get(norm, norm, `%${norm}%`) as { id: string } | undefined;
             targetId = found?.id ?? norm.slice(0, 12).padEnd(12, '0');
-            if (!found) upsertStub.run(targetId, raw);
+            if (!found) upsertStub.run(targetId, raw, teamId ?? null);
         }
 
         if (targetId === dep.sourceId) continue;
@@ -203,25 +207,29 @@ export async function ingestFromUrl(repoUrl: string, teamName?: string): Promise
     }
 
     db.prepare(`
-        INSERT INTO activity_feed (id, type, service_id, title, detail)
-        VALUES (?, 'SCAN_COMPLETE', ?, 'Ingest complete', ?)
+        INSERT INTO activity_feed (id, type, service_id, team_id, title, detail)
+        VALUES (?, 'SCAN_COMPLETE', ?, ?, 'Ingest complete', ?)
     `).run(
         randomUUID(),
         result.services[0]?.id ?? null,
+        teamId ?? null,
         `${result.services.length} services · ${result.dependencies.length} deps · ${result.issues.length} issues (source: ${repoUrl})`,
     );
 
-    // If a teamName was supplied, stamp every ingested service with it so the
-    // graph can be filtered per-team in the Manager Dashboard.
+    // If a teamName was supplied, stamp every ingested service with it
     if (teamName) {
-        db.prepare(`UPDATE services SET team = ? WHERE repo_url = ?`).run(teamName, repoUrl);
+        if (teamId) {
+            db.prepare(`UPDATE services SET team = ? WHERE team_id = ?`).run(teamName, teamId);
+        } else {
+            db.prepare(`UPDATE services SET team = ? WHERE repo_url = ?`).run(teamName, repoUrl);
+        }
         console.log(`[Seed] 🏷  Tagged all services from ${repoUrl} with team "${teamName}"`);
     }
 
-    try { saveSnapshot('latest'); } catch { /* non-fatal */ }
+    try { saveSnapshot('latest', teamId); } catch { /* non-fatal */ }
 
     console.log(`[Seed] ✅ Done — ${result.services.length} services, ${result.dependencies.length} deps, ${result.issues.length} issues`);
-    return { services: result.services.length, deps: result.dependencies.length, issues: result.issues.length, repoUrl };
+    return { services: result.services.length, deps: result.dependencies.length, issues: result.issues.length, repoUrl, teamId: teamId ?? null };
 }
 
 // ── Main export ───────────────────────────────────────────────────────────────

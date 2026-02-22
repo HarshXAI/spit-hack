@@ -285,7 +285,7 @@ function findPrecedent(
  * @returns ImpactAnalysisResult with direct + transitive blast radius
  * @throws { statusCode: 404, message } if service not found
  */
-export function analyzeImpact(input: AnalyzeImpactInput): ImpactAnalysisResult {
+export function analyzeImpact(input: AnalyzeImpactInput, teamId?: string): ImpactAnalysisResult {
     const db = getDb();
     const { serviceId, changeType, targetEndpoint } = input;
 
@@ -321,8 +321,8 @@ export function analyzeImpact(input: AnalyzeImpactInput): ImpactAnalysisResult {
 
     db.prepare(`
     INSERT INTO impact_analyses
-      (id, trigger_type, trigger_ref, service_id, affected, risk_score, confidence, precedent)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      (id, trigger_type, trigger_ref, service_id, affected, risk_score, confidence, precedent, team_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
         analysisId,
         changeType,
@@ -332,18 +332,20 @@ export function analyzeImpact(input: AnalyzeImpactInput): ImpactAnalysisResult {
         riskScore,
         confidence,
         precedent ? JSON.stringify(precedent) : null,
+        teamId ?? null,
     );
 
     // Write activity feed entry
     db.prepare(`
-    INSERT INTO activity_feed (id, type, service_id, title, detail, severity)
-    VALUES (?, 'IMPACT_ANALYSED', ?, ?, ?, ?)
+    INSERT INTO activity_feed (id, type, service_id, title, detail, severity, team_id)
+    VALUES (?, 'IMPACT_ANALYSED', ?, ?, ?, ?, ?)
   `).run(
         randomUUID(),
         serviceId,
         `Impact analysis: ${changeType} ${targetEndpoint}`,
         summary,
         riskScore >= 7 ? 'critical' : riskScore >= 4 ? 'warning' : 'info',
+        teamId ?? null,
     );
 
     const now = new Date().toISOString();

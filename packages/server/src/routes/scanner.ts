@@ -89,6 +89,7 @@ const ScanBodySchema = z.object({
     repoPath: z.string().min(1, 'repoPath is required'),
     repoUrl: z.string().url('repoUrl must be a valid URL').optional(),
     team: z.string().optional(),
+    teamId: z.string().optional(),
 });
 
 router.post('/scan', async (req: Request, res: Response): Promise<void> => {
@@ -100,7 +101,7 @@ router.post('/scan', async (req: Request, res: Response): Promise<void> => {
         return;
     }
 
-    const { repoPath, repoUrl, team } = parse.data;
+    const { repoPath, repoUrl, team, teamId } = parse.data;
 
     try {
         // Run full monorepo scan (sync)
@@ -110,14 +111,15 @@ router.post('/scan', async (req: Request, res: Response): Promise<void> => {
         // ── Persist services ──────────────────────────────────────────────────
         const upsertService = db.prepare(`
             INSERT INTO services
-              (id, name, repo_url, repo_subpath, team, language, health_score, health_tier,
+              (id, name, repo_url, repo_subpath, team, team_id, language, health_score, health_tier,
                doc_coverage, test_coverage, last_commit, last_ingested)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(id) DO UPDATE SET
               name          = excluded.name,
               repo_url      = excluded.repo_url,
               repo_subpath  = excluded.repo_subpath,
               team          = excluded.team,
+              team_id       = excluded.team_id,
               language      = excluded.language,
               health_score  = excluded.health_score,
               health_tier   = excluded.health_tier,
@@ -153,6 +155,7 @@ router.post('/scan', async (req: Request, res: Response): Promise<void> => {
         for (const svc of result.services) {
             upsertService.run(
                 svc.id, svc.name, svc.repoUrl, svc.repoSubpath, svc.team ?? team ?? null,
+                teamId ?? null,
                 svc.language,
                 svc.healthScore, toHealthTier(svc.healthScore),
                 svc.docCoverage, svc.testCoverage, svc.lastCommit,

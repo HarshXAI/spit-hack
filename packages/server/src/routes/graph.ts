@@ -24,7 +24,8 @@ export const graphRouter: ExpressRouter = Router();
 graphRouter.get('/nodes', (req: Request, res: Response) => {
     try {
         const team = typeof req.query.team === 'string' && req.query.team ? req.query.team : undefined;
-        const nodes = getNodes(team);
+        const teamId = typeof req.query.teamId === 'string' && req.query.teamId ? req.query.teamId : undefined;
+        const nodes = getNodes(team, teamId);
         res.json({ success: true, data: nodes, meta: { count: nodes.length } });
     } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error';
@@ -36,7 +37,8 @@ graphRouter.get('/nodes', (req: Request, res: Response) => {
 graphRouter.get('/edges', (req: Request, res: Response) => {
     try {
         const team = typeof req.query.team === 'string' && req.query.team ? req.query.team : undefined;
-        const edges = getEdges(team);
+        const teamId = typeof req.query.teamId === 'string' && req.query.teamId ? req.query.teamId : undefined;
+        const edges = getEdges(team, teamId);
         res.json({ success: true, data: edges, meta: { count: edges.length } });
     } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error';
@@ -45,9 +47,10 @@ graphRouter.get('/edges', (req: Request, res: Response) => {
 });
 
 // ── GET /health ───────────────────────────────────────────────────────────────
-graphRouter.get('/health', (_req: Request, res: Response) => {
+graphRouter.get('/health', (req: Request, res: Response) => {
     try {
-        const health = getSystemHealth();
+        const teamId = typeof req.query.teamId === 'string' && req.query.teamId ? req.query.teamId : undefined;
+        const health = getSystemHealth(teamId);
         res.json({ success: true, data: health });
     } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error';
@@ -81,9 +84,10 @@ graphRouter.get('/snapshot/:version', (req: Request, res: Response) => {
 });
 
 // ── GET /critical-issues ──────────────────────────────────────────────────────
-graphRouter.get('/critical-issues', (_req: Request, res: Response) => {
+graphRouter.get('/critical-issues', (req: Request, res: Response) => {
     try {
-        const issues = getCriticalIssues();
+        const teamId = typeof req.query.teamId === 'string' && req.query.teamId ? req.query.teamId : undefined;
+        const issues = getCriticalIssues(teamId);
         res.json({ success: true, data: issues, meta: { count: issues.length } });
     } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error';

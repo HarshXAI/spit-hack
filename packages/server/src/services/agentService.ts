@@ -636,6 +636,7 @@ Return JSON with this exact structure:
 export async function runDeepAnalysis(
     repoPath: string,
     serviceRoots: Array<{ id: string; name: string; language: string; dir: string }>,
+    teamId?: string,
 ): Promise<DeepAnalysisResult> {
     const analysisId = randomUUID();
     const startTime = Date.now();
@@ -695,7 +696,7 @@ export async function runDeepAnalysis(
     };
 
     // Phase 3: Persist to DB
-    persistAnalysis(result);
+    persistAnalysis(result, teamId);
 
     console.log(`[Agents] Deep analysis ${analysisId} complete in ${result.totalDurationMs}ms`);
     return result;
@@ -703,38 +704,15 @@ export async function runDeepAnalysis(
 
 // ── DB persistence ────────────────────────────────────────────────────────────
 
-function persistAnalysis(result: DeepAnalysisResult): void {
+function persistAnalysis(result: DeepAnalysisResult, teamId?: string): void {
     const db = getDb();
 
-    // Ensure agent_analyses table exists
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS agent_analyses (
-            id TEXT PRIMARY KEY,
-            analysis_id TEXT NOT NULL,
-            agent_name TEXT NOT NULL,
-            service_id TEXT,
-            service_name TEXT,
-            findings TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            duration_ms INTEGER,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS knowledge_graph (
-            id TEXT PRIMARY KEY,
-            analysis_id TEXT NOT NULL,
-            nodes TEXT NOT NULL,
-            edges TEXT NOT NULL,
-            architecture TEXT NOT NULL,
-            self_healing TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-    `);
+    // Tables already created by schema.ts runMigrations() — no dynamic DDL needed.
 
     // Store agent results
     const insertAgent = db.prepare(`
-        INSERT INTO agent_analyses (id, analysis_id, agent_name, service_id, service_name, findings, summary, duration_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO agent_analyses (id, analysis_id, agent_name, service_id, service_name, findings, summary, duration_ms, team_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     for (const ar of result.agentResults) {
@@ -742,13 +720,14 @@ function persistAnalysis(result: DeepAnalysisResult): void {
             randomUUID(), result.analysisId, ar.agentName,
             ar.serviceId, ar.serviceName,
             JSON.stringify(ar.findings), ar.summary, ar.durationMs,
+            teamId ?? null,
         );
     }
 
     // Store orchestrator result (knowledge graph)
     db.prepare(`
-        INSERT INTO knowledge_graph (id, analysis_id, nodes, edges, architecture, self_healing, summary)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO knowledge_graph (id, analysis_id, nodes, edges, architecture, self_healing, summary, team_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
         randomUUID(), result.analysisId,
         JSON.stringify(result.orchestratorResult.nodes),
@@ -756,6 +735,7 @@ function persistAnalysis(result: DeepAnalysisResult): void {
         JSON.stringify(result.orchestratorResult.architecture),
         JSON.stringify(result.orchestratorResult.selfHealingSuggestions),
         result.orchestratorResult.summary,
+        teamId ?? null,
     );
 
     // Now the crucial part: update the REAL graph with the agent-discovered edges
@@ -836,36 +816,31 @@ function persistAnalysis(result: DeepAnalysisResult): void {
 
     // Add activity feed entry
     db.prepare(`
-        INSERT INTO activity_feed (id, type, title, detail, severity)
-        VALUES (?, 'DEEP_ANALYSIS', ?, ?, 'info')
+        INSERT INTO activity_feed (id, type, title, detail, severity, team_id)
+        VALUES (?, 'DEEP_ANALYSIS', ?, ?, 'info', ?)
     `).run(
         randomUUID(),
         `Deep analysis complete: ${orch.nodes.length} nodes, ${orch.edges.length} edges`,
         `${result.agentResults.length} agents analyzed ${result.servicesAnalyzed} services in ${(result.totalDurationMs / 1000).toFixed(1)}s. Found ${result.totalFindings} findings.`,
+        teamId ?? null,
     );
 }
 
 // ── Get latest knowledge graph from DB ────────────────────────────────────────
 
-export function getLatestKnowledgeGraph(): OrchestratorResult | null {
+export function getLatestKnowledgeGraph(teamId?: string): OrchestratorResult | null {
     const db = getDb();
 
-    // Ensure table exists
-    db.exec(`CREATE TABLE IF NOT EXISTS knowledge_graph (
-        id TEXT PRIMARY KEY,
-        analysis_id TEXT NOT NULL,
-        nodes TEXT NOT NULL,
-        edges TEXT NOT NULL,
-        architecture TEXT NOT NULL,
-        self_healing TEXT NOT NULL,
-        summary TEXT NOT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )`);
+    const query = teamId
+        ? `SELECT nodes, edges, architecture, self_healing, summary
+           FROM knowledge_graph WHERE team_id = ? ORDER BY created_at DESC LIMIT 1`
+        : `SELECT nodes, edges, architecture, self_healing, summary
+           FROM knowledge_graph ORDER BY created_at DESC LIMIT 1`;
 
-    const row = db.prepare(`
-        SELECT nodes, edges, architecture, self_healing, summary
-        FROM knowledge_graph ORDER BY created_at DESC LIMIT 1
-    `).get() as {
+    const row = (teamId
+        ? db.prepare(query).get(teamId)
+        : db.prepare(query).get()
+    ) as {
         nodes: string; edges: string; architecture: string;
         self_healing: string; summary: string;
     } | undefined;
@@ -887,7 +862,7 @@ export function getLatestKnowledgeGraph(): OrchestratorResult | null {
 
 // ── Get agent analysis history ────────────────────────────────────────────────
 
-export function getAgentAnalyses(analysisId?: string): Array<{
+export function getAgentAnalyses(analysisId?: string, teamId?: string): Array<{
     agentName: string;
     serviceName: string;
     findingCount: number;
@@ -897,25 +872,24 @@ export function getAgentAnalyses(analysisId?: string): Array<{
 }> {
     const db = getDb();
 
-    db.exec(`CREATE TABLE IF NOT EXISTS agent_analyses (
-        id TEXT PRIMARY KEY,
-        analysis_id TEXT NOT NULL,
-        agent_name TEXT NOT NULL,
-        service_id TEXT,
-        service_name TEXT,
-        findings TEXT NOT NULL,
-        summary TEXT NOT NULL,
-        duration_ms INTEGER,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )`);
+    let query: string;
+    let params: unknown[];
 
-    const query = analysisId
-        ? `SELECT agent_name, service_name, findings, summary, duration_ms, created_at FROM agent_analyses WHERE analysis_id = ? ORDER BY created_at DESC`
-        : `SELECT agent_name, service_name, findings, summary, duration_ms, created_at FROM agent_analyses ORDER BY created_at DESC LIMIT 100`;
+    if (analysisId && teamId) {
+        query = `SELECT agent_name, service_name, findings, summary, duration_ms, created_at FROM agent_analyses WHERE analysis_id = ? AND team_id = ? ORDER BY created_at DESC`;
+        params = [analysisId, teamId];
+    } else if (analysisId) {
+        query = `SELECT agent_name, service_name, findings, summary, duration_ms, created_at FROM agent_analyses WHERE analysis_id = ? ORDER BY created_at DESC`;
+        params = [analysisId];
+    } else if (teamId) {
+        query = `SELECT agent_name, service_name, findings, summary, duration_ms, created_at FROM agent_analyses WHERE team_id = ? ORDER BY created_at DESC LIMIT 100`;
+        params = [teamId];
+    } else {
+        query = `SELECT agent_name, service_name, findings, summary, duration_ms, created_at FROM agent_analyses ORDER BY created_at DESC LIMIT 100`;
+        params = [];
+    }
 
-    const rows = analysisId
-        ? db.prepare(query).all(analysisId) as Array<{ agent_name: string; service_name: string; findings: string; summary: string; duration_ms: number; created_at: string }>
-        : db.prepare(query).all() as Array<{ agent_name: string; service_name: string; findings: string; summary: string; duration_ms: number; created_at: string }>;
+    const rows = db.prepare(query).all(...params) as Array<{ agent_name: string; service_name: string; findings: string; summary: string; duration_ms: number; created_at: string }>;
 
     return rows.map((r) => ({
         agentName: r.agent_name,
