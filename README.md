@@ -8,6 +8,21 @@ Built at a hackathon. KA-CHOW scans repositories, maps services and their depend
 
 A deprecated endpoint with seven silent dependents is invisible in a single-repo PR. KA-CHOW ingests code, API definitions and git history across repos so the blast radius is visible at review time.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    CFG["kachow.config.yaml"] --> CLI["kachow CLI"]
+    CLI --> SCAN["Python AST scanners"]
+    GH["GitHub webhooks"] --> API
+    SCAN --> Q["Ingest queue<br/>BullMQ + Redis"] --> W["Ingest worker"]
+    W --> DB[("SQLite<br/>knowledge graph")]
+    DB --> API["Express API"]
+    API --> IMP["Impact analysis"]
+    API --> LLM["LLM agents<br/>QA · healing"]
+    API -->|SSE| UI["React dashboard"]
+```
+
 ## Features
 
 - Repo scanning with Python AST scanners (service and dependency extraction)
